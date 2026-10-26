@@ -1024,8 +1024,8 @@ const panesFSM = new PanesFSM(store, {
   clearJsonClaudeSession: (sessionId) =>
     store.dispatch({ type: 'jsonClaude/sessionCleared', payload: { sessionId } }),
   startJsonClaudeWithPrompt: (sessionId, worktreePath, initialPrompt) => {
-    void startJsonClaudeSession(sessionId, worktreePath).then((started) => {
-      if (started && initialPrompt) jsonClaudeManager.send(sessionId, initialPrompt)
+    void startJsonClaudeSession(sessionId, worktreePath).then((running) => {
+      if (running && initialPrompt) jsonClaudeManager.send(sessionId, initialPrompt)
     })
   },
   startJsonClaude: (sessionId, worktreePath) => {
@@ -1051,43 +1051,51 @@ function findJsonClaudeTabModel(sessionId: string): string | undefined {
   return undefined
 }
 
-const startingJsonClaude = new Map<string, { cancelled: boolean }>()
+const startingJsonClaude = new Map<string, { cancelled: boolean; done: Promise<boolean> }>()
 
 /** Single source of truth for "spin up the json-claude subprocess for
  *  this sessionId". Used by the jsonClaude:start IPC handler, the
  *  panesFSM's startJsonClaudeWithPrompt + startJsonClaude options
  *  (kickoff + wake), so all paths produce the same dispatch + seed +
  *  create order. Idempotent — JsonClaudeManager.create() short-circuits
- *  if the instance is already running, and a start already waiting on
- *  the worktree's shell env absorbs a second call for the same id.
- *  Resolves true once the subprocess was created. */
-async function startJsonClaudeSession(sessionId: string, worktreePath: string): Promise<boolean> {
-  if (jsonClaudeManager.hasSession(sessionId) || startingJsonClaude.has(sessionId)) return false
-  // Both the --resume decision and the subprocess env key off the Claude
-  // home the worktree's shell reports; resolve it before touching either.
-  const token = { cancelled: false }
-  startingJsonClaude.set(sessionId, token)
-  try {
-    await resolveShellEnv(worktreePath)
-  } finally {
-    if (startingJsonClaude.get(sessionId) === token) startingJsonClaude.delete(sessionId)
-  }
-  if (token.cancelled || jsonClaudeManager.hasSession(sessionId)) return false
-  store.dispatch({
-    type: 'jsonClaude/sessionStarted',
-    payload: {
-      sessionId,
-      worktreePath,
-      defaultPermissionMode:
-        store.getSnapshot().state.settings.jsonModeDefaultPermissionMode
+ *  if the instance is already running, and a second call for an id whose
+ *  start is still waiting on the worktree's shell env joins that start
+ *  rather than racing it. Resolves true once the session is running,
+ *  whichever caller created it: the kickoff prompt must land even when
+ *  the renderer's own start beat the one carrying the prompt. */
+function startJsonClaudeSession(sessionId: string, worktreePath: string): Promise<boolean> {
+  if (jsonClaudeManager.hasSession(sessionId)) return Promise.resolve(true)
+  const pending = startingJsonClaude.get(sessionId)
+  if (pending) return pending.done
+  const token = { cancelled: false, done: Promise.resolve(false) }
+  token.done = (async () => {
+    // Both the --resume decision and the subprocess env key off the Claude
+    // home the worktree's shell reports; resolve it before touching either.
+    try {
+      await resolveShellEnv(worktreePath)
+    } finally {
+      if (startingJsonClaude.get(sessionId) === token) startingJsonClaude.delete(sessionId)
     }
-  })
-  jsonClaudeManager.seedFromTranscript(sessionId, worktreePath)
-  const permMode =
-    store.getSnapshot().state.jsonClaude.sessions[sessionId]?.permissionMode ||
-    'default'
-  jsonClaudeManager.create(sessionId, worktreePath, permMode, findJsonClaudeTabModel(sessionId))
-  return true
+    if (token.cancelled) return false
+    if (jsonClaudeManager.hasSession(sessionId)) return true
+    store.dispatch({
+      type: 'jsonClaude/sessionStarted',
+      payload: {
+        sessionId,
+        worktreePath,
+        defaultPermissionMode:
+          store.getSnapshot().state.settings.jsonModeDefaultPermissionMode
+      }
+    })
+    jsonClaudeManager.seedFromTranscript(sessionId, worktreePath)
+    const permMode =
+      store.getSnapshot().state.jsonClaude.sessions[sessionId]?.permissionMode ||
+      'default'
+    jsonClaudeManager.create(sessionId, worktreePath, permMode, findJsonClaudeTabModel(sessionId))
+    return true
+  })()
+  startingJsonClaude.set(sessionId, token)
+  return token.done
 }
 
 /** Kill a chat subprocess, or a start for it that is still waiting on the
